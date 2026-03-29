@@ -8,12 +8,12 @@ const CLIENT_SECRET = process.env.MELI_CLIENT_SECRET;
 const REFRESH_TOKEN = process.env.MELI_REFRESH_TOKEN;
 const AFFILIATE_TAG = 'laisa9320492524395';
 
-let cachedToken = null;
+let cachedToken  = null;
+let cachedUserId = null;
 let tokenExpiry  = 0;
 
 async function getToken() {
     if (cachedToken && Date.now() < tokenExpiry) return cachedToken;
-
     const r = await fetch('https://api.mercadolibre.com/oauth/token', {
         method: 'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -26,82 +26,21 @@ async function getToken() {
     });
     const data = await r.json();
     if (data.access_token) {
-        cachedToken = data.access_token;
+        cachedToken  = data.access_token;
+        cachedUserId = data.user_id;
         tokenExpiry  = Date.now() + (data.expires_in - 300) * 1000;
     }
     return data.access_token || null;
 }
 
-// Busca IDs via /sites/MLA/search (puede dar 403),
-// si falla usa /highlights + búsqueda por keyword en catálogo
-async function buscarIds(q, token) {
-    // Intento 1: search directo (a veces funciona con user token)
-    const r1 = await fetch(
-        `https://api.mercadolibre.com/sites/MLA/search?q=${encodeURIComponent(q)}&limit=10&sort=price_asc&condition=new`,
-        { headers: { 'Authorization': `Bearer ${token}` } }
-    );
-    if (r1.status === 200) {
-        const body = await r1.json();
-        if (body.results?.length > 0) {
-            console.log('✅ Search directo funcionó');
-            return { source: 'search', items: body.results };
-        }
-    }
-    console.log('⚠️ Search directo bloqueado, usando catálogo...');
-
-    // Intento 2: product search (catálogo) — este sí funciona desde servidores
-    const r2 = await fetch(
-        `https://api.mercadolibre.com/sites/MLA/search?q=${encodeURIComponent(q)}&limit=20&sort=price_asc`,
-        { headers: { 'Authorization': `Bearer ${token}`, 'X-Format-New': 'true' } }
-    );
-    if (r2.status === 200) {
-        const body = await r2.json();
-        if (body.results?.length > 0) {
-            console.log('✅ Catálogo funcionó');
-            return { source: 'search', items: body.results };
-        }
-    }
-
-    // Intento 3: products/search (catálogo de productos, no listings)
-    const r3 = await fetch(
-        `https://api.mercadolibre.com/sites/MLA/products/search?q=${encodeURIComponent(q)}&limit=10`,
-        { headers: { 'Authorization': `Bearer ${token}` } }
-    );
-    if (r3.status === 200) {
-        const body = await r3.json();
-        if (body.results?.length > 0) {
-            console.log('✅ Products/search funcionó, buscando listings...');
-            // Para cada producto del catálogo, buscamos el listing más barato
-            const ids = body.results.slice(0, 8).map(p => p.id);
-            const listings = await Promise.all(ids.map(id =>
-                fetch(`https://api.mercadolibre.com/products/${id}/items?limit=3&sort=price_asc`, {
-                    headers: { 'Authorization': `Bearer ${token}` }
-                }).then(r => r.json()).catch(() => null)
-            ));
-
-            const items = [];
-            for (let i = 0; i < body.results.length; i++) {
-                const prod = body.results[i];
-                const listing = listings[i]?.results?.[0];
-                if (listing?.price) {
-                    items.push({
-                        id: listing.id,
-                        title: prod.name,
-                        price: listing.price,
-                        thumbnail: prod.pictures?.[0]?.url || listing.thumbnail,
-                        permalink: listing.permalink,
-                        shipping: listing.shipping,
-                        seller: listing.seller,
-                        condition: listing.condition,
-                    });
-                }
-                if (items.length >= 5) break;
-            }
-            if (items.length > 0) return { source: 'catalog', items };
-        }
-    }
-
-    return { source: 'none', items: [] };
+async function getUserId(token) {
+    if (cachedUserId) return cachedUserId;
+    const r = await fetch('https://api.mercadolibre.com/users/me', {
+        headers: { Authorization: `Bearer ${token}` }
+    });
+    const d = await r.json();
+    cachedUserId = d.id;
+    return d.id;
 }
 
 function addAffiliateTag(permalink) {
@@ -113,6 +52,61 @@ function addAffiliateTag(permalink) {
     } catch {
         return permalink + (permalink.includes('?') ? '&' : '?') + `matt_tool=${AFFILIATE_TAG}`;
     }
+}
+
+async function buscar(q, token) {
+    const headers = {
+        'Authorization': `Bearer ${token}`,
+        'User-Agent': 'MercadoLibre/iOS 10.171.0',
+    };
+
+    // Estrategia A: search directo
+    for (const ep of [
+        `https://api.mercadolibre.com/sites/MLA/search?q=${encodeURIComponent(q)}&limit=10&sort=price_asc&condition=new`,
+        `https://api.mercadolibre.com/sites/MLA/search?q=${encodeURIComponent(q)}&limit=10`,
+    ]) {
+        const r = await fetch(ep, { headers });
+        if (r.status === 200) {
+            const body = await r.json();
+            if (body.results?.length > 0) return { source: 'A', items: body.results };
+        }
+        console.log('A falló:', r.status);
+    }
+
+    // Estrategia B: domain_discovery → search por categoría
+    const catR = await fetch(
+        `https://api.mercadolibre.com/sites/MLA/domain_discovery/search?q=${encodeURIComponent(q)}&limit=3`,
+        { headers }
+    );
+    console.log('domain_discovery:', catR.status);
+    if (catR.status === 200) {
+        const cats = await catR.json();
+        const catId = cats?.[0]?.category_id;
+        if (catId) {
+            const itemsR = await fetch(
+                `https://api.mercadolibre.com/sites/MLA/search?category=${catId}&q=${encodeURIComponent(q)}&limit=10&sort=price_asc`,
+                { headers }
+            );
+            if (itemsR.status === 200) {
+                const body = await itemsR.json();
+                if (body.results?.length > 0) return { source: 'B', items: body.results };
+            }
+            console.log('B falló:', itemsR.status);
+        }
+    }
+
+    // Estrategia C: /sites/MLA/products
+    const prodR = await fetch(
+        `https://api.mercadolibre.com/sites/MLA/products?status=active&q=${encodeURIComponent(q)}&limit=10`,
+        { headers }
+    );
+    console.log('products:', prodR.status);
+    if (prodR.status === 200) {
+        const body = await prodR.json();
+        if (body.results?.length > 0) return { source: 'C', items: body.results };
+    }
+
+    return { source: 'none', items: [] };
 }
 
 const server = http.createServer(async (req, res) => {
@@ -132,64 +126,51 @@ const server = http.createServer(async (req, res) => {
 
     res.setHeader('Content-Type', 'application/json');
 
+    if (path === '/api/test') {
+        try {
+            const token  = await getToken();
+            const userId = await getUserId(token);
+            const check  = async (ep) => fetch(ep, { headers: { Authorization: `Bearer ${token}`, 'User-Agent': 'MercadoLibre/iOS 10.171.0' } }).then(r => r.status);
+            res.end(JSON.stringify({
+                token_ok:         !!token,
+                user_id:          userId,
+                search:           await check('https://api.mercadolibre.com/sites/MLA/search?q=termo&limit=1'),
+                domain_discovery: await check('https://api.mercadolibre.com/sites/MLA/domain_discovery/search?q=termo&limit=1'),
+                products:         await check('https://api.mercadolibre.com/sites/MLA/products?status=active&q=termo&limit=1'),
+                users_me:         await check('https://api.mercadolibre.com/users/me'),
+            }));
+        } catch(e) { res.end(JSON.stringify({ error: e.message })); }
+        return;
+    }
+
     if (path === '/api/buscar') {
         const q = params.q;
         if (!q) { res.end('[]'); return; }
-
         try {
             const token = await getToken();
-            if (!token) {
-                res.statusCode = 401;
-                res.end(JSON.stringify({ error: 'No se pudo obtener token' }));
-                return;
-            }
+            if (!token) { res.statusCode = 401; res.end(JSON.stringify({ error: 'Token fallido' })); return; }
 
-            const { source, items } = await buscarIds(q, token);
+            const { source, items } = await buscar(q, token);
+            if (!items.length) { res.end(JSON.stringify({ error: 'sin_resultados', source })); return; }
 
-            if (!items.length) {
-                res.end(JSON.stringify({ error: 'sin_resultados', source }));
-                return;
-            }
-
-            // Filtramos vendedores con buena reputación cuando hay info
             const filtrados = items.filter(p => {
                 const rep = p.seller?.seller_reputation?.level_id;
-                if (!rep) return true;
-                return ['5_green', '4_light_green'].includes(rep);
+                return !rep || ['5_green', '4_light_green'].includes(rep);
             });
             const lista = filtrados.length >= 3 ? filtrados : items;
 
             const productos = lista.slice(0, 5).map(p => ({
-                title:     p.title || 'Sin título',
-                price:     p.price || null,
-                thumbnail: (p.thumbnail || '').replace('http://', 'https://').replace(/-[A-Z]\.jpg$/, '-O.jpg'),
+                title:     p.title || p.name || 'Sin título',
+                price:     p.price || p.buy_box_winner?.price || null,
+                thumbnail: (p.thumbnail || p.pictures?.[0]?.url || '').replace('http://', 'https://').replace(/-[A-Z]\.jpg$/, '-O.jpg'),
                 permalink: addAffiliateTag(p.permalink),
                 shipping:  { free_shipping: p.shipping?.free_shipping ?? false },
-                condition: p.condition,
                 source,
             }));
 
             res.end(JSON.stringify(productos));
-
         } catch(e) {
-            console.error('Error:', e);
             res.statusCode = 500;
-            res.end(JSON.stringify({ error: e.message }));
-        }
-        return;
-    }
-
-    // Endpoint de diagnóstico
-    if (path === '/api/test') {
-        try {
-            const token = await getToken();
-            const tests = await Promise.all([
-                fetch(`https://api.mercadolibre.com/sites/MLA/search?q=termo&limit=1`, { headers: { Authorization: `Bearer ${token}` } }).then(r => r.status),
-                fetch(`https://api.mercadolibre.com/sites/MLA/products/search?q=termo&limit=1`, { headers: { Authorization: `Bearer ${token}` } }).then(r => r.status),
-                fetch(`https://api.mercadolibre.com/users/me`, { headers: { Authorization: `Bearer ${token}` } }).then(r => r.status),
-            ]);
-            res.end(JSON.stringify({ token_ok: !!token, search: tests[0], products_search: tests[1], users_me: tests[2] }));
-        } catch(e) {
             res.end(JSON.stringify({ error: e.message }));
         }
         return;
