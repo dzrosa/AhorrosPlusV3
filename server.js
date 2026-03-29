@@ -31,58 +31,81 @@ async function getToken() {
     return data.access_token || null;
 }
 
-function addAffiliateTag(permalink) {
-    if (!permalink) return permalink;
+function buildAffiliateLink(pid, listingPermalink) {
+    // Usamos el permalink del listing si existe, sino construimos el link al producto
+    const base = listingPermalink || `https://www.mercadolibre.com.ar/p/${pid}`;
     try {
-        const u = new URL(permalink);
+        const u = new URL(base);
         u.searchParams.set('matt_tool', AFFILIATE_TAG);
         return u.toString();
     } catch {
-        return permalink + (permalink.includes('?') ? '&' : '?') + `matt_tool=${AFFILIATE_TAG}`;
+        return `https://www.mercadolibre.com.ar/p/${pid}?matt_tool=${AFFILIATE_TAG}`;
     }
 }
 
-// Para un product ID, busca el listing más barato con precio real
 async function getListingForProduct(pid, headers) {
-    // Primero traemos el nombre e imagen del producto del catálogo
     const [prodR, itemsR] = await Promise.all([
-        fetch(`https://api.mercadolibre.com/products/${pid}?attributes=id,name,pictures`, { headers }),
+        fetch(`https://api.mercadolibre.com/products/${pid}?attributes=id,name,pictures,buy_box_winner`, { headers }),
         fetch(`https://api.mercadolibre.com/products/${pid}/items?limit=5&sort=price_asc&condition=new`, { headers }),
     ]);
 
     if (prodR.status !== 200) return null;
     const prod = await prodR.json();
+    const name = prod.name || '';
+    const img  = (prod.pictures?.[0]?.url || '').replace('http://', 'https://').replace(/-[A-Z]\.jpg$/, '-O.jpg');
 
-    let listing = null;
+    // Opción 1: listing más barato
     if (itemsR.status === 200) {
         const data = await itemsR.json();
-        // Filtramos por buena reputación si hay suficientes
         const results = data.results || [];
         const buenos = results.filter(p => {
             const rep = p.seller?.seller_reputation?.level_id;
             return !rep || ['5_green', '4_light_green'].includes(rep);
         });
-        listing = (buenos.length > 0 ? buenos : results)[0] || null;
+        const listing = (buenos.length > 0 ? buenos : results)[0];
+        if (listing?.price) {
+            return {
+                title:     name || listing.title || '',
+                price:     listing.price,
+                thumbnail: img || (listing.thumbnail || '').replace('http://', 'https://').replace(/-[A-Z]\.jpg$/, '-O.jpg'),
+                permalink: buildAffiliateLink(pid, listing.permalink),
+                shipping:  { free_shipping: listing.shipping?.free_shipping ?? false },
+                condition: listing.condition || 'new',
+            };
+        }
     }
 
-    if (!listing?.price) return null;
+    // Opción 2: buy_box_winner
+    const bb = prod.buy_box_winner;
+    if (bb?.price) {
+        return {
+            title:     name,
+            price:     bb.price,
+            thumbnail: img,
+            permalink: buildAffiliateLink(pid, null),
+            shipping:  { free_shipping: bb.free_shipping ?? false },
+            condition: 'new',
+        };
+    }
 
-    const img = prod.pictures?.[0]?.url || listing.thumbnail || '';
+    // Opción 3: sin precio pero con link válido
+    if (name && img) {
+        return {
+            title:     name,
+            price:     null,
+            thumbnail: img,
+            permalink: buildAffiliateLink(pid, null),
+            shipping:  { free_shipping: false },
+            condition: 'new',
+        };
+    }
 
-    return {
-        title:     prod.name || listing.title,
-        price:     listing.price,
-        thumbnail: img.replace('http://', 'https://').replace(/-[A-Z]\.jpg$/, '-O.jpg'),
-        permalink: addAffiliateTag(listing.permalink),
-        shipping:  { free_shipping: listing.shipping?.free_shipping ?? false },
-        condition: listing.condition,
-    };
+    return null;
 }
 
 async function buscar(q, token) {
     const headers = { Authorization: `Bearer ${token}`, 'User-Agent': 'MercadoLibre/iOS 10.171.0' };
 
-    // Paso 1: domain_discovery → category_id
     const discR = await fetch(
         `https://api.mercadolibre.com/sites/MLA/domain_discovery/search?q=${encodeURIComponent(q)}&limit=3`,
         { headers }
@@ -92,20 +115,23 @@ async function buscar(q, token) {
     const catId = cats?.[0]?.category_id;
     if (!catId) return [];
 
-    // Paso 2: highlights → product IDs
     const hlR = await fetch(`https://api.mercadolibre.com/highlights/MLA/category/${catId}`, { headers });
     if (hlR.status !== 200) return [];
     const hl  = await hlR.json();
-    const ids = (hl.content || []).slice(0, 12).map(x => x.id);
+    const ids = (hl.content || []).slice(0, 15).map(x => x.id);
     if (!ids.length) return [];
 
-    // Paso 3: para cada product ID, buscamos el listing más barato en paralelo
-    // Limitamos a 8 paralelos para no sobrecargar
-    const resultados = await Promise.all(ids.slice(0, 8).map(pid => getListingForProduct(pid, headers)));
+    const lote1 = await Promise.all(ids.slice(0, 8).map(pid => getListingForProduct(pid, headers)));
+    let productos = lote1.filter(Boolean);
 
-    // Filtramos nulos y tomamos los primeros 5 con precio
-    const productos = resultados.filter(Boolean).slice(0, 5);
-    return productos;
+    if (productos.filter(p => p.price).length < 3 && ids.length > 8) {
+        const lote2 = await Promise.all(ids.slice(8, 15).map(pid => getListingForProduct(pid, headers)));
+        productos = [...productos, ...lote2.filter(Boolean)];
+    }
+
+    const conPrecio = productos.filter(p => p.price);
+    const sinPrecio = productos.filter(p => !p.price);
+    return [...conPrecio, ...sinPrecio].slice(0, 5);
 }
 
 const server = http.createServer(async (req, res) => {
