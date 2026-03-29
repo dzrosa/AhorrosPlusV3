@@ -8,9 +8,8 @@ const CLIENT_SECRET = process.env.MELI_CLIENT_SECRET;
 const REFRESH_TOKEN = process.env.MELI_REFRESH_TOKEN;
 const AFFILIATE_TAG = 'laisa9320492524395';
 
-let cachedToken  = null;
-let cachedUserId = null;
-let tokenExpiry  = 0;
+let cachedToken = null;
+let tokenExpiry = 0;
 
 async function getToken() {
     if (cachedToken && Date.now() < tokenExpiry) return cachedToken;
@@ -26,9 +25,8 @@ async function getToken() {
     });
     const data = await r.json();
     if (data.access_token) {
-        cachedToken  = data.access_token;
-        cachedUserId = data.user_id;
-        tokenExpiry  = Date.now() + (data.expires_in - 300) * 1000;
+        cachedToken = data.access_token;
+        tokenExpiry = Date.now() + (data.expires_in - 300) * 1000;
     }
     return data.access_token || null;
 }
@@ -44,25 +42,90 @@ function addAffiliateTag(permalink) {
     }
 }
 
-// Prueba un endpoint y devuelve { status, body_sample }
-async function probe(ep, headers) {
-    try {
-        const r = await fetch(ep, { headers });
-        let body = null;
-        try { body = await r.json(); } catch {}
-        return {
-            status: r.status,
-            keys:   body ? Object.keys(body).slice(0, 8) : [],
-            sample: body ? JSON.stringify(body).substring(0, 200) : null,
-        };
-    } catch(e) {
-        return { status: 'ERR', error: e.message };
+async function buscar(q, token) {
+    const headers = {
+        'Authorization': `Bearer ${token}`,
+        'User-Agent': 'MercadoLibre/iOS 10.171.0',
+    };
+
+    // Paso 1: domain_discovery → category_id
+    const discR = await fetch(
+        `https://api.mercadolibre.com/sites/MLA/domain_discovery/search?q=${encodeURIComponent(q)}&limit=5`,
+        { headers }
+    );
+    if (discR.status !== 200) {
+        console.error('domain_discovery falló:', discR.status);
+        return [];
     }
+    const cats = await discR.json();
+    const catId = cats?.[0]?.category_id;
+    if (!catId) {
+        console.error('No se encontró categoría para:', q);
+        return [];
+    }
+    console.log(`Categoría para "${q}": ${catId}`);
+
+    // Paso 2: highlights de esa categoría → lista de IDs
+    const hlR = await fetch(
+        `https://api.mercadolibre.com/highlights/MLA/category/${catId}`,
+        { headers }
+    );
+    if (hlR.status !== 200) {
+        console.error('highlights falló:', hlR.status);
+        return [];
+    }
+    const hl = await hlR.json();
+    const ids = (hl.content || [])
+        .filter(x => x.type === 'ITEM' || x.type === 'PRODUCT')
+        .slice(0, 10)
+        .map(x => x.id);
+
+    if (!ids.length) {
+        console.error('Highlights sin IDs');
+        return [];
+    }
+    console.log('IDs de highlights:', ids.join(', '));
+
+    // Paso 3: multiget de items para obtener título, precio, imagen
+    const ATTRS = 'id,title,price,thumbnail,permalink,shipping,seller,condition,buying_mode';
+    const mgR = await fetch(
+        `https://api.mercadolibre.com/items?ids=${ids.join(',')}&attributes=${ATTRS}`,
+        { headers }
+    );
+    if (mgR.status !== 200) {
+        console.error('multiget falló:', mgR.status);
+        return [];
+    }
+    const mg = await mgR.json();
+
+    // mg es array de { code, body }
+    const items = mg
+        .filter(r => r.code === 200 && r.body?.price)
+        .map(r => r.body);
+
+    console.log(`Items con precio: ${items.length} de ${mg.length}`);
+
+    // Filtro de reputación
+    const buenos = items.filter(p => {
+        const rep = p.seller?.seller_reputation?.level_id;
+        return !rep || ['5_green', '4_light_green'].includes(rep);
+    });
+    const lista = buenos.length >= 3 ? buenos : items;
+
+    return lista.slice(0, 5).map(p => ({
+        title:     p.title,
+        price:     p.price,
+        thumbnail: (p.thumbnail || '').replace('http://', 'https://').replace(/-[A-Z]\.jpg$/, '-O.jpg'),
+        permalink: addAffiliateTag(p.permalink),
+        shipping:  { free_shipping: p.shipping?.free_shipping ?? false },
+        condition: p.condition,
+    }));
 }
 
 const server = http.createServer(async (req, res) => {
     const parsed = url.parse(req.url, true);
     const path   = parsed.pathname;
+    const params = parsed.query;
 
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Cache-Control', 'no-store');
@@ -76,34 +139,17 @@ const server = http.createServer(async (req, res) => {
 
     res.setHeader('Content-Type', 'application/json');
 
-    // Mapeo completo de endpoints alternativos
-    if (path === '/api/scan') {
+    if (path === '/api/buscar') {
+        const q = params.q;
+        if (!q) { res.end('[]'); return; }
         try {
             const token = await getToken();
-            const h = { Authorization: `Bearer ${token}`, 'User-Agent': 'MercadoLibre/iOS 10.171.0' };
-            const CAT = 'MLA47769'; // Termos - de domain_discovery
-
-            const results = {
-                // Endpoints de items directos
-                highlights_cat:     await probe(`https://api.mercadolibre.com/highlights/MLA/category/${CAT}`, h),
-                highlights_general: await probe(`https://api.mercadolibre.com/highlights/MLA`, h),
-                // Items de una categoría
-                category_items:     await probe(`https://api.mercadolibre.com/categories/${CAT}/items?limit=5`, h),
-                // Trends
-                trends:             await probe(`https://api.mercadolibre.com/trends/MLA`, h),
-                trends_cat:         await probe(`https://api.mercadolibre.com/trends/MLA/${CAT}`, h),
-                // Visits / top items
-                top_items:          await probe(`https://api.mercadolibre.com/sites/MLA/items/visits?date_from=2024-01-01&category=${CAT}&limit=5`, h),
-                // Promotions
-                promotions:         await probe(`https://api.mercadolibre.com/sites/MLA/promotions?type=discount&category=${CAT}`, h),
-                // Item directo de ejemplo (sabemos que MLA se puede leer)
-                item_direct:        await probe(`https://api.mercadolibre.com/items/MLA1400594269`, h),
-                // Multiget de items conocidos de la categoría
-                items_multiget:     await probe(`https://api.mercadolibre.com/items?ids=MLA1400594269,MLA1500594270&attributes=id,title,price,permalink,thumbnail`, h),
-            };
-
-            res.end(JSON.stringify(results, null, 2));
+            if (!token) { res.statusCode = 401; res.end(JSON.stringify({ error: 'Token fallido' })); return; }
+            const productos = await buscar(q, token);
+            res.end(JSON.stringify(productos));
         } catch(e) {
+            console.error('Error:', e);
+            res.statusCode = 500;
             res.end(JSON.stringify({ error: e.message }));
         }
         return;
