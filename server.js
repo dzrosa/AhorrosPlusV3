@@ -47,13 +47,11 @@ async function getListingForProduct(pid, headers) {
         fetch(`https://api.mercadolibre.com/products/${pid}?attributes=id,name,pictures,buy_box_winner`, { headers }),
         fetch(`https://api.mercadolibre.com/products/${pid}/items?limit=5&sort=price_asc&condition=new`, { headers }),
     ]);
-
     if (prodR.status !== 200) return null;
     const prod = await prodR.json();
     const name = prod.name || '';
     const img  = (prod.pictures?.[0]?.url || '').replace('http://', 'https://').replace(/-[A-Z]\.jpg$/, '-O.jpg');
 
-    // Opción 1: listing más barato
     if (itemsR.status === 200) {
         const data = await itemsR.json();
         const results = data.results || [];
@@ -73,8 +71,6 @@ async function getListingForProduct(pid, headers) {
             };
         }
     }
-
-    // Opción 2: buy_box_winner
     const bb = prod.buy_box_winner;
     if (bb?.price) {
         return {
@@ -86,42 +82,54 @@ async function getListingForProduct(pid, headers) {
             condition: 'new',
         };
     }
+    return null;
+}
 
-    return null; // sin precio = descartamos, no mostramos sin precio
+async function getHighlightIds(catId, headers) {
+    const r = await fetch(`https://api.mercadolibre.com/highlights/MLA/category/${catId}`, { headers });
+    if (r.status !== 200) return [];
+    const hl = await r.json();
+    return (hl.content || []).map(x => x.id);
 }
 
 async function buscar(q, token) {
     const headers = { Authorization: `Bearer ${token}`, 'User-Agent': 'MercadoLibre/iOS 10.171.0' };
 
-    // domain_discovery → category_id
+    // domain_discovery — pedimos hasta 5 categorías
     const discR = await fetch(
-        `https://api.mercadolibre.com/sites/MLA/domain_discovery/search?q=${encodeURIComponent(q)}&limit=3`,
+        `https://api.mercadolibre.com/sites/MLA/domain_discovery/search?q=${encodeURIComponent(q)}&limit=5`,
         { headers }
     );
     if (discR.status !== 200) return [];
-    const cats  = await discR.json();
-    const catId = cats?.[0]?.category_id;
-    if (!catId) return [];
+    const cats = await discR.json();
+    if (!cats.length) return [];
 
-    // highlights → todos los IDs disponibles
-    const hlR = await fetch(`https://api.mercadolibre.com/highlights/MLA/category/${catId}`, { headers });
-    if (hlR.status !== 200) return [];
-    const hl  = await hlR.json();
-    const ids = (hl.content || []).map(x => x.id); // todos, sin slice
+    // Traemos highlights de todas las categorías en paralelo
+    const allHighlights = await Promise.all(
+        cats.map(c => getHighlightIds(c.category_id, headers))
+    );
+
+    // Unimos IDs sin duplicados
+    const seen = new Set();
+    const ids  = [];
+    for (const lote of allHighlights) {
+        for (const id of lote) {
+            if (!seen.has(id)) { seen.add(id); ids.push(id); }
+        }
+    }
+
+    console.log(`"${q}": ${cats.length} categorías, ${ids.length} IDs únicos`);
     if (!ids.length) return [];
 
-    console.log(`Total IDs disponibles para "${q}": ${ids.length}`);
-
-    // Procesamos en lotes de 6 hasta tener 5 productos con precio
+    // Procesamos en lotes de 6 hasta tener 5 con precio
     const LOTE = 6;
     const productos = [];
-
     for (let i = 0; i < ids.length && productos.length < 5; i += LOTE) {
-        const lote = ids.slice(i, i + LOTE);
-        const resultados = await Promise.all(lote.map(pid => getListingForProduct(pid, headers)));
-        const validos = resultados.filter(Boolean); // solo los que tienen precio
+        const lote     = ids.slice(i, i + LOTE);
+        const results  = await Promise.all(lote.map(pid => getListingForProduct(pid, headers)));
+        const validos  = results.filter(Boolean);
         productos.push(...validos);
-        console.log(`Lote ${i/LOTE + 1}: ${validos.length} válidos, total: ${productos.length}`);
+        console.log(`Lote ${Math.floor(i/LOTE)+1}: ${validos.length} con precio, total: ${productos.length}`);
     }
 
     return productos.slice(0, 5);
