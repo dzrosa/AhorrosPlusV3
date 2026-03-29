@@ -32,7 +32,6 @@ async function getToken() {
 }
 
 function buildAffiliateLink(pid, listingPermalink) {
-    // Usamos el permalink del listing si existe, sino construimos el link al producto
     const base = listingPermalink || `https://www.mercadolibre.com.ar/p/${pid}`;
     try {
         const u = new URL(base);
@@ -65,7 +64,7 @@ async function getListingForProduct(pid, headers) {
         const listing = (buenos.length > 0 ? buenos : results)[0];
         if (listing?.price) {
             return {
-                title:     name || listing.title || '',
+                title:     name || listing.title,
                 price:     listing.price,
                 thumbnail: img || (listing.thumbnail || '').replace('http://', 'https://').replace(/-[A-Z]\.jpg$/, '-O.jpg'),
                 permalink: buildAffiliateLink(pid, listing.permalink),
@@ -88,24 +87,13 @@ async function getListingForProduct(pid, headers) {
         };
     }
 
-    // Opción 3: sin precio pero con link válido
-    if (name && img) {
-        return {
-            title:     name,
-            price:     null,
-            thumbnail: img,
-            permalink: buildAffiliateLink(pid, null),
-            shipping:  { free_shipping: false },
-            condition: 'new',
-        };
-    }
-
-    return null;
+    return null; // sin precio = descartamos, no mostramos sin precio
 }
 
 async function buscar(q, token) {
     const headers = { Authorization: `Bearer ${token}`, 'User-Agent': 'MercadoLibre/iOS 10.171.0' };
 
+    // domain_discovery → category_id
     const discR = await fetch(
         `https://api.mercadolibre.com/sites/MLA/domain_discovery/search?q=${encodeURIComponent(q)}&limit=3`,
         { headers }
@@ -115,23 +103,28 @@ async function buscar(q, token) {
     const catId = cats?.[0]?.category_id;
     if (!catId) return [];
 
+    // highlights → todos los IDs disponibles
     const hlR = await fetch(`https://api.mercadolibre.com/highlights/MLA/category/${catId}`, { headers });
     if (hlR.status !== 200) return [];
     const hl  = await hlR.json();
-    const ids = (hl.content || []).slice(0, 15).map(x => x.id);
+    const ids = (hl.content || []).map(x => x.id); // todos, sin slice
     if (!ids.length) return [];
 
-    const lote1 = await Promise.all(ids.slice(0, 8).map(pid => getListingForProduct(pid, headers)));
-    let productos = lote1.filter(Boolean);
+    console.log(`Total IDs disponibles para "${q}": ${ids.length}`);
 
-    if (productos.filter(p => p.price).length < 3 && ids.length > 8) {
-        const lote2 = await Promise.all(ids.slice(8, 15).map(pid => getListingForProduct(pid, headers)));
-        productos = [...productos, ...lote2.filter(Boolean)];
+    // Procesamos en lotes de 6 hasta tener 5 productos con precio
+    const LOTE = 6;
+    const productos = [];
+
+    for (let i = 0; i < ids.length && productos.length < 5; i += LOTE) {
+        const lote = ids.slice(i, i + LOTE);
+        const resultados = await Promise.all(lote.map(pid => getListingForProduct(pid, headers)));
+        const validos = resultados.filter(Boolean); // solo los que tienen precio
+        productos.push(...validos);
+        console.log(`Lote ${i/LOTE + 1}: ${validos.length} válidos, total: ${productos.length}`);
     }
 
-    const conPrecio = productos.filter(p => p.price);
-    const sinPrecio = productos.filter(p => !p.price);
-    return [...conPrecio, ...sinPrecio].slice(0, 5);
+    return productos.slice(0, 5);
 }
 
 const server = http.createServer(async (req, res) => {
