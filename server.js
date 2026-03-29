@@ -1,12 +1,12 @@
 const http = require('http');
 const url  = require('url');
+const fs   = require('fs');
 
 const PORT = process.env.PORT || 3000;
-
 const CLIENT_ID     = process.env.MELI_CLIENT_ID;
 const CLIENT_SECRET = process.env.MELI_CLIENT_SECRET;
 const REFRESH_TOKEN = process.env.MELI_REFRESH_TOKEN;
-const REDIRECT_URI  = process.env.REDIRECT_URI || '';
+const AFFILIATE_ID  = 'laisa9320492524395';
 
 async function getToken() {
     const r = await fetch('https://api.mercadolibre.com/oauth/token', {
@@ -31,32 +31,12 @@ const server = http.createServer(async (req, res) => {
     res.setHeader('Content-Type', 'application/json');
     res.setHeader('Cache-Control', 'no-store');
 
-    // Servir index.html
     if (path === '/' || path === '/index.html') {
-        const fs = require('fs');
         res.setHeader('Content-Type', 'text/html');
         res.end(fs.readFileSync('./index.html'));
         return;
     }
 
-    // Endpoint gettoken
-    if (path === '/api/gettoken' && params.code) {
-        const r = await fetch('https://api.mercadolibre.com/oauth/token', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-            body: new URLSearchParams({
-                grant_type:    'authorization_code',
-                client_id:     CLIENT_ID,
-                client_secret: CLIENT_SECRET,
-                code:          params.code,
-                redirect_uri:  REDIRECT_URI
-            })
-        });
-        res.end(JSON.stringify(await r.json()));
-        return;
-    }
-
-    // Endpoint buscar
     if (path === '/api/buscar') {
         const q = params.q;
         if (!q) { res.end('[]'); return; }
@@ -69,14 +49,35 @@ const server = http.createServer(async (req, res) => {
                 return;
             }
 
-            const searchRes = await fetch(
+            // Probar múltiples variantes del endpoint
+            const endpoints = [
                 `https://api.mercadolibre.com/sites/MLA/search?q=${encodeURIComponent(q)}&limit=10&sort=price_asc&condition=new`,
-                { headers: { 'Authorization': `Bearer ${auth.access_token}` } }
-            );
-            const data = await searchRes.json();
+                `https://api.mercadolibre.com/sites/MLA/search?q=${encodeURIComponent(q)}&limit=10&sort=price_asc`,
+                `https://api.mercadolibre.com/sites/MLA/search?q=${encodeURIComponent(q)}&limit=10`,
+            ];
 
-            if (data.error) {
-                res.end(JSON.stringify({ error: data.error, message: data.message, status: searchRes.status }));
+            let data = null;
+            let lastStatus = 0;
+
+            for (const endpoint of endpoints) {
+                const r = await fetch(endpoint, {
+                    headers: { 
+                        'Authorization': `Bearer ${auth.access_token}`,
+                        'User-Agent': 'Mozilla/5.0',
+                        'X-Forwarded-For': '200.45.249.0', // IP argentina
+                    }
+                });
+                lastStatus = r.status;
+                const body = await r.json();
+                if (r.status === 200 && body.results?.length > 0) {
+                    data = body;
+                    break;
+                }
+                console.log(`Endpoint ${endpoint} → ${r.status}:`, JSON.stringify(body).substring(0, 100));
+            }
+
+            if (!data) {
+                res.end(JSON.stringify({ error: 'forbidden', status: lastStatus, message: 'MeLi bloquea desde este servidor' }));
                 return;
             }
 
@@ -108,4 +109,4 @@ const server = http.createServer(async (req, res) => {
     res.end('Not found');
 });
 
-server.listen(PORT, () => console.log(`Servidor corriendo en puerto ${PORT}`));
+server.listen(PORT, () => console.log(`Servidor en puerto ${PORT}`));
